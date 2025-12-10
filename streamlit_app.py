@@ -158,13 +158,11 @@ def apply_threshold_screening(df1, base_expected_mask):
     if "Extended Price" not in df1.columns:
         raise ValueError("File 1 missing required column 'Extended Price' for threshold logic.")
 
-    # numeric Extended Price
     df1["_ext_price_num"] = pd.to_numeric(df1["Extended Price"], errors="coerce").fillna(0.0)
 
     df_base = df1[base_expected_mask].copy()
 
     if df_base.empty:
-        # Nothing to screen
         df1["below_threshold"] = False
         screened_view = pd.DataFrame(
             columns=[
@@ -178,7 +176,6 @@ def apply_threshold_screening(df1, base_expected_mask):
         )
         return df1, screened_view
 
-    # aggregate total extended price per quote
     grp = (
         df_base.groupby("quote_norm", as_index=False)
         .agg({
@@ -189,16 +186,15 @@ def apply_threshold_screening(df1, base_expected_mask):
         .rename(columns={"_ext_price_num": "total_extended_price"})
     )
 
-    grp["taker_norm"] = grp["Taker Name"].astype(str).strip()
+    # ✅ FIX: use .str.strip() on the Series
+    grp["taker_norm"] = grp["Taker Name"].astype(str).str.strip()
     grp["threshold_limit"] = grp["taker_norm"].map(CUSTOM_THRESHOLDS).fillna(DEFAULT_THRESHOLD)
 
     grp["below_threshold"] = grp["total_extended_price"] < grp["threshold_limit"]
 
-    # map result back to df1 rows
     below_map = dict(zip(grp["quote_norm"], grp["below_threshold"]))
     df1["below_threshold"] = df1["quote_norm"].map(below_map).fillna(False)
 
-    # screened quotes (unique)
     screened_quotes = grp[grp["below_threshold"]].copy()
 
     screened_view = screened_quotes[[
@@ -250,7 +246,6 @@ def analyze_quotes(df1, df2, won_label, noresp_label):
     total_file1_rows = len(df1)
     unique_file1_quotes = df1["quote_norm"].nunique(dropna=True)
 
-    # expected behavior BEFORE threshold
     base_expected_in_system = []
     expected_status = []
     for _, row in df1.iterrows():
@@ -266,10 +261,8 @@ def analyze_quotes(df1, df2, won_label, noresp_label):
     df1["expected_status"] = expected_status
     base_expected_mask = df1["base_expected_in_system"]
 
-    # apply threshold screening
     df1, screened_view = apply_threshold_screening(df1, base_expected_mask)
 
-    # final expectation after threshold
     df1["expected_in_system"] = df1["base_expected_in_system"] & (~df1["below_threshold"])
     f1_expected = df1[df1["expected_in_system"]].copy()
 
@@ -281,7 +274,6 @@ def analyze_quotes(df1, df2, won_label, noresp_label):
         if not screened_view.empty else 0
     )
 
-    # minimal view from file 2
     df2_min = df2[["quote_norm", "Status"]].copy()
 
     merged = f1_expected.merge(
@@ -299,7 +291,6 @@ def analyze_quotes(df1, df2, won_label, noresp_label):
     unique_found = merged.loc[merged["found_in_system"], "quote_norm"].nunique(dropna=True)
     unique_missing = merged.loc[~merged["found_in_system"], "quote_norm"].nunique(dropna=True)
 
-    # missing view
     missing_view = merged.loc[~merged["found_in_system"]].copy()
     missing_view = (
         missing_view[["Recall Order", "quote_norm", "expected_status",
@@ -315,14 +306,12 @@ def analyze_quotes(df1, df2, won_label, noresp_label):
         .sort_values("Quote ID (normalized)")
     )
 
-    # won mismatch
     won_mask = merged["expected_status"].str.casefold() == won_label.lower()
     won_found = merged[won_mask & merged["found_in_system"]].copy()
     wrong_won = won_found[
         won_found["Status"].fillna("").str.casefold() != won_label.lower()
     ].copy()
 
-    # no response mismatch
     noresp_mask = merged["expected_status"].fillna("").str.casefold() == noresp_label.lower()
     noresp_found = merged[noresp_mask & merged["found_in_system"]].copy()
     wrong_noresp = noresp_found[
@@ -422,7 +411,7 @@ if st.button("Run Comparison"):
                 merged,
             ) = analyze_quotes(df1, df2, won_label=won_label, noresp_label=noresp_label)
 
-            # ---- File 1 summary ----
+            # File 1 summary
             st.subheader("File 1 Summary")
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -440,7 +429,7 @@ if st.button("Run Comparison"):
 
             st.markdown("---")
 
-            # ---- Summary AFTER threshold ----
+            # Result summary after threshold
             st.subheader("Result Summary (quotes that should be in File 2 AFTER threshold)")
 
             r1, r2, r3 = st.columns(3)
@@ -462,7 +451,7 @@ if st.button("Run Comparison"):
 
             st.markdown("---")
 
-            # ---- Screened quotes ----
+            # Screened quotes
             st.subheader("Screened Quotes (below threshold – not processed)")
             if not screened_view.empty:
                 st.write(
@@ -470,7 +459,6 @@ if st.button("Run Comparison"):
                     "screened out because their total Extended Price is below "
                     "the taker's threshold."
                 )
-                # show ENTIRE screened list (scrollable)
                 st.dataframe(
                     screened_view,
                     use_container_width=True,
@@ -497,7 +485,7 @@ if st.button("Run Comparison"):
 
             st.markdown("---")
 
-            # ---- Missing quote details ----
+            # Missing quotes
             st.subheader("Quotes that SHOULD be in File 2 but are MISSING (unique list)")
             if not missing_view.empty:
                 st.dataframe(
@@ -527,7 +515,7 @@ if st.button("Run Comparison"):
 
             st.markdown("---")
 
-            # ---- Incorrect Won statuses ----
+            # Wrong won
             st.subheader(f"Quotes that SHOULD be '{won_label}' but are different")
             st.write(
                 f"Unique quotes with wrong status (expected '{won_label}'): "
@@ -544,7 +532,7 @@ if st.button("Run Comparison"):
 
             st.markdown("---")
 
-            # ---- Incorrect No Response statuses ----
+            # Wrong no-response
             st.subheader(f"Quotes that SHOULD be '{noresp_label}' but are different")
             st.write(
                 f"Unique quotes with wrong status (expected '{noresp_label}'): "
