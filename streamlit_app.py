@@ -38,7 +38,6 @@ if not st.session_state.authenticated:
 # -------------------------------------------------
 DEFAULT_THRESHOLD = 500  # dollars
 
-# Custom thresholds per taker name (must match "Taker Name" in File 1)
 CUSTOM_THRESHOLDS = {
     "Tony Phillips": 2400,
     "Brian Johnson": 2000,
@@ -78,11 +77,10 @@ CUSTOM_THRESHOLDS = {
     "Catalina Wilson": 500,
     "Patrick St Peter": 500,
 }
-# Normalize keys once
 CUSTOM_THRESHOLDS = {k.strip(): v for k, v in CUSTOM_THRESHOLDS.items()}
 
 # -------------------------------------------------
-# HELPERS (NO GLOBAL DATA STATE)
+# HELPERS
 # -------------------------------------------------
 
 
@@ -119,9 +117,7 @@ def read_any_table(uploaded_file):
 
 def derive_expected_status(projected_val, completed_val, won_label, noresp_label):
     """
-    Map Projected Order + completed to expected behavior.
-
-    Rules:
+    Projected + completed -> expected status.
 
     Projected   completed   expected_in_system   expected_status
     ------------------------------------------------------------
@@ -151,34 +147,38 @@ def derive_expected_status(projected_val, completed_val, won_label, noresp_label
 
 def apply_threshold_screening(df1, base_expected_mask):
     """
-    Apply threshold rules to quotes that are expected to be in the system.
+    Threshold logic:
 
-    - Sum Extended Price by quote (Recall Order / quote_norm)
-    - Use Taker Name to pick a threshold (custom or default)
-    - Quotes whose TOTAL < threshold are "screened" and will NOT be processed.
+    - Work only on quotes that are expected_in_system BEFORE threshold.
+    - Sum Extended Price per quote_norm.
+    - Get threshold by Taker Name (custom or default).
+    - If total < threshold => quote is SCREENED (below_threshold=True).
     """
 
-    # Ensure numeric Extended Price
-    ext_col = "Extended Price"
-    if ext_col not in df1.columns:
-        raise ValueError(f"File 1 missing required column '{ext_col}' for threshold logic.")
+    if "Extended Price" not in df1.columns:
+        raise ValueError("File 1 missing required column 'Extended Price' for threshold logic.")
 
-    # Make a numeric copy
-    df1["_ext_price_num"] = pd.to_numeric(df1[ext_col], errors="coerce").fillna(0.0)
+    # numeric Extended Price
+    df1["_ext_price_num"] = pd.to_numeric(df1["Extended Price"], errors="coerce").fillna(0.0)
 
-    # Work only on rows that were expected (before threshold)
     df_base = df1[base_expected_mask].copy()
 
     if df_base.empty:
         # Nothing to screen
         df1["below_threshold"] = False
         screened_view = pd.DataFrame(
-            columns=["Quote ID (normalized)", "Recall Order (File 1)",
-                     "Taker Name", "Total Extended Price", "Threshold Limit"]
+            columns=[
+                "Quote ID (normalized)",
+                "Recall Order (File 1)",
+                "Taker Name",
+                "Total Extended Price",
+                "Threshold Limit",
+                "Below Threshold?",
+            ]
         )
         return df1, screened_view
 
-    # Aggregate by quote
+    # aggregate total extended price per quote
     grp = (
         df_base.groupby("quote_norm", as_index=False)
         .agg({
@@ -189,39 +189,43 @@ def apply_threshold_screening(df1, base_expected_mask):
         .rename(columns={"_ext_price_num": "total_extended_price"})
     )
 
-    # Apply thresholds by taker
-    grp["taker_norm"] = grp["Taker Name"].astype(str).str.strip()
+    grp["taker_norm"] = grp["Taker Name"].astype(str).strip()
     grp["threshold_limit"] = grp["taker_norm"].map(CUSTOM_THRESHOLDS).fillna(DEFAULT_THRESHOLD)
 
     grp["below_threshold"] = grp["total_extended_price"] < grp["threshold_limit"]
 
-    # Screened quotes (unique)
-    screened_quotes = grp[grp["below_threshold"]].copy()
-
-    # Map below_threshold flag back to df1 rows
+    # map result back to df1 rows
     below_map = dict(zip(grp["quote_norm"], grp["below_threshold"]))
     df1["below_threshold"] = df1["quote_norm"].map(below_map).fillna(False)
 
-    # Build screened view for display/download
+    # screened quotes (unique)
+    screened_quotes = grp[grp["below_threshold"]].copy()
+
     screened_view = screened_quotes[[
-        "quote_norm", "Recall Order", "Taker Name",
-        "total_extended_price", "threshold_limit"
+        "quote_norm",
+        "Recall Order",
+        "Taker Name",
+        "total_extended_price",
+        "threshold_limit",
+        "below_threshold",
     ]].rename(columns={
         "quote_norm": "Quote ID (normalized)",
         "Recall Order": "Recall Order (File 1)",
         "Taker Name": "Taker Name",
         "total_extended_price": "Total Extended Price",
         "threshold_limit": "Threshold Limit",
-    })
+        "below_threshold": "Below Threshold?",
+    }).sort_values("Total Extended Price")
 
     return df1, screened_view
 
 
 def analyze_quotes(df1, df2, won_label, noresp_label):
     """
-    Core comparison logic.
-    df1: Recall/Order data
-    df2: Quote system export
+    Main comparison:
+    - apply status logic
+    - apply threshold screening
+    - compare to File 2
     """
 
     df1 = df1.copy()
@@ -240,15 +244,13 @@ def analyze_quotes(df1, df2, won_label, noresp_label):
         missing = required_2 - set(df2.columns)
         raise ValueError(f"File 2 missing required column(s): {missing}")
 
-    # Normalize quote IDs
     df1["quote_norm"] = df1["Recall Order"].apply(normalize_quote_id)
     df2["quote_norm"] = df2["Quote Number"].apply(normalize_quote_id)
 
-    # File 1 base stats
     total_file1_rows = len(df1)
     unique_file1_quotes = df1["quote_norm"].nunique(dropna=True)
 
-    # Expected behavior from File 1 BEFORE threshold
+    # expected behavior BEFORE threshold
     base_expected_in_system = []
     expected_status = []
     for _, row in df1.iterrows():
@@ -262,27 +264,24 @@ def analyze_quotes(df1, df2, won_label, noresp_label):
 
     df1["base_expected_in_system"] = base_expected_in_system
     df1["expected_status"] = expected_status
-
     base_expected_mask = df1["base_expected_in_system"]
 
-    # ---- Threshold screening (per quote / taker) ----
+    # apply threshold screening
     df1, screened_view = apply_threshold_screening(df1, base_expected_mask)
 
-    # Final "expected_in_system" after threshold screening
+    # final expectation after threshold
     df1["expected_in_system"] = df1["base_expected_in_system"] & (~df1["below_threshold"])
-
-    # Quotes that should be in system AFTER threshold
     f1_expected = df1[df1["expected_in_system"]].copy()
 
     total_should_show_rows = len(f1_expected)
     unique_should_show = f1_expected["quote_norm"].nunique(dropna=True)
 
-    # Screened quotes count (unique)
-    screened_unique_count = screened_view["Quote ID (normalized)"].nunique(
-        dropna=True
-    ) if not screened_view.empty else 0
+    screened_unique_count = (
+        screened_view["Quote ID (normalized)"].nunique(dropna=True)
+        if not screened_view.empty else 0
+    )
 
-    # File 2 minimal just for matching
+    # minimal view from file 2
     df2_min = df2[["quote_norm", "Status"]].copy()
 
     merged = f1_expected.merge(
@@ -298,4 +297,285 @@ def analyze_quotes(df1, df2, won_label, noresp_label):
     total_missing_rows = int(total_should_show_rows - total_found_rows)
 
     unique_found = merged.loc[merged["found_in_system"], "quote_norm"].nunique(dropna=True)
-    unique_missing = merged.loc[~merged["found_in_system"], "quote_norm"].nunique(dropna=T_]()_
+    unique_missing = merged.loc[~merged["found_in_system"], "quote_norm"].nunique(dropna=True)
+
+    # missing view
+    missing_view = merged.loc[~merged["found_in_system"]].copy()
+    missing_view = (
+        missing_view[["Recall Order", "quote_norm", "expected_status",
+                      "Projected Order", "completed"]]
+        .drop_duplicates()
+        .rename(columns={
+            "Recall Order": "Recall Order (File 1)",
+            "quote_norm": "Quote ID (normalized)",
+            "expected_status": "Expected Status",
+            "Projected Order": "Projected Order (File 1)",
+            "completed": "Completed (File 1)",
+        })
+        .sort_values("Quote ID (normalized)")
+    )
+
+    # won mismatch
+    won_mask = merged["expected_status"].str.casefold() == won_label.lower()
+    won_found = merged[won_mask & merged["found_in_system"]].copy()
+    wrong_won = won_found[
+        won_found["Status"].fillna("").str.casefold() != won_label.lower()
+    ].copy()
+
+    # no response mismatch
+    noresp_mask = merged["expected_status"].fillna("").str.casefold() == noresp_label.lower()
+    noresp_found = merged[noresp_mask & merged["found_in_system"]].copy()
+    wrong_noresp = noresp_found[
+        noresp_found["Status"].fillna("").str.casefold() != noresp_label.lower()
+    ].copy()
+
+    summary = {
+        "total_file1_rows": int(total_file1_rows),
+        "unique_file1_quotes": int(unique_file1_quotes),
+        "screened_unique_count": int(screened_unique_count),
+        "total_should_show_rows": int(total_should_show_rows),
+        "unique_should_show": int(unique_should_show),
+        "unique_found": int(unique_found),
+        "unique_missing": int(unique_missing),
+        "total_found_rows": int(total_found_rows),
+        "total_missing_rows": int(total_missing_rows),
+        "wrong_won_count": int(wrong_won["quote_norm"].nunique(dropna=True)),
+        "wrong_noresp_count": int(wrong_noresp["quote_norm"].nunique(dropna=True)),
+    }
+
+    wrong_won_view = (
+        wrong_won[["Recall Order", "expected_status", "Status"]]
+        .drop_duplicates()
+        .rename(
+            columns={
+                "Recall Order": "Recall Order (File 1)",
+                "Status": "Actual Status (File 2)",
+                "expected_status": "Expected Status",
+            }
+        )
+    )
+
+    wrong_noresp_view = (
+        wrong_noresp[["Recall Order", "expected_status", "Status"]]
+        .drop_duplicates()
+        .rename(
+            columns={
+                "Recall Order": "Recall Order (File 1)",
+                "Status": "Actual Status (File 2)",
+                "expected_status": "Expected Status",
+            }
+        )
+    )
+
+    return summary, wrong_won_view, wrong_noresp_view, missing_view, screened_view, merged
+
+
+# -------------------------------------------------
+# UI
+# -------------------------------------------------
+
+st.title("quote-status-mapper")
+
+with st.expander("Status Logic Settings (optional)", expanded=False):
+    col_a, col_b = st.columns(2)
+    with col_a:
+        won_label = st.text_input("Text of 'Won' status in File 2", value="Won")
+    with col_b:
+        noresp_label = st.text_input(
+            "Text of 'No Response' status in File 2", value="No Response"
+        )
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("File 1 – Recall / Order Data")
+    file1 = st.file_uploader(
+        "Upload File 1 (Recall Order, Projected Order, completed, Extended Price, etc.)",
+        type=["xlsx", "xls", "csv"],
+        key="file1",
+    )
+
+with col2:
+    st.subheader("File 2 – Quote System Export")
+    file2 = st.file_uploader(
+        "Upload File 2 (Quote Number, Status, ...)",
+        type=["xlsx", "xls", "csv"],
+        key="file2",
+    )
+
+st.markdown("---")
+
+if st.button("Run Comparison"):
+    if file1 is None or file2 is None:
+        st.error("Please upload BOTH File 1 and File 2.")
+    else:
+        try:
+            df1 = read_any_table(file1)
+            df2 = read_any_table(file2)
+
+            (
+                summary,
+                wrong_won_view,
+                wrong_noresp_view,
+                missing_view,
+                screened_view,
+                merged,
+            ) = analyze_quotes(df1, df2, won_label=won_label, noresp_label=noresp_label)
+
+            # ---- File 1 summary ----
+            st.subheader("File 1 Summary")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Total uploaded rows (File 1)", summary["total_file1_rows"])
+            with c2:
+                st.metric(
+                    "Unique quote number count (File 1)",
+                    summary["unique_file1_quotes"],
+                )
+            with c3:
+                st.metric(
+                    "Screened quotes below threshold (unique)",
+                    summary["screened_unique_count"],
+                )
+
+            st.markdown("---")
+
+            # ---- Summary AFTER threshold ----
+            st.subheader("Result Summary (quotes that should be in File 2 AFTER threshold)")
+
+            r1, r2, r3 = st.columns(3)
+            with r1:
+                st.metric(
+                    "Total UNIQUE quote numbers that SHOULD be in File 2",
+                    summary["unique_should_show"],
+                )
+            with r2:
+                st.metric(
+                    "Available quote number count (unique)",
+                    summary["unique_found"],
+                )
+            with r3:
+                st.metric(
+                    "Missing quote number count (unique)",
+                    summary["unique_missing"],
+                )
+
+            st.markdown("---")
+
+            # ---- Screened quotes ----
+            st.subheader("Screened Quotes (below threshold – not processed)")
+            if not screened_view.empty:
+                st.write(
+                    "These quotes met the Projected/Completed logic but were "
+                    "screened out because their total Extended Price is below "
+                    "the taker's threshold."
+                )
+                # show ENTIRE screened list (scrollable)
+                st.dataframe(
+                    screened_view,
+                    use_container_width=True,
+                    height=260,
+                )
+
+                buf_screen = io.BytesIO()
+                with pd.ExcelWriter(buf_screen, engine="openpyxl") as writer:
+                    screened_view.to_excel(
+                        writer, index=False, sheet_name="ScreenedQuotes"
+                    )
+                buf_screen.seek(0)
+                st.download_button(
+                    label="Download Screened Quotes (with totals & thresholds)",
+                    data=buf_screen,
+                    file_name="screened_quotes.xlsx",
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    ),
+                )
+            else:
+                st.info("No quotes were screened out by threshold logic.")
+
+            st.markdown("---")
+
+            # ---- Missing quote details ----
+            st.subheader("Quotes that SHOULD be in File 2 but are MISSING (unique list)")
+            if not missing_view.empty:
+                st.dataframe(
+                    missing_view,
+                    use_container_width=True,
+                    height=260,
+                )
+
+                miss_buf = io.BytesIO()
+                with pd.ExcelWriter(miss_buf, engine="openpyxl") as writer:
+                    missing_view.to_excel(
+                        writer, index=False, sheet_name="MissingQuotes"
+                    )
+                miss_buf.seek(0)
+
+                st.download_button(
+                    label="Download Missing Quote Details",
+                    data=miss_buf,
+                    file_name="missing_quotes.xlsx",
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    ),
+                )
+            else:
+                st.info("No missing quotes (after threshold).")
+
+            st.markdown("---")
+
+            # ---- Incorrect Won statuses ----
+            st.subheader(f"Quotes that SHOULD be '{won_label}' but are different")
+            st.write(
+                f"Unique quotes with wrong status (expected '{won_label}'): "
+                f"**{summary['wrong_won_count']}**"
+            )
+            if not wrong_won_view.empty:
+                st.dataframe(
+                    wrong_won_view,
+                    use_container_width=True,
+                    height=220,
+                )
+            else:
+                st.info(f"No mismatches found for expected '{won_label}'.")
+
+            st.markdown("---")
+
+            # ---- Incorrect No Response statuses ----
+            st.subheader(f"Quotes that SHOULD be '{noresp_label}' but are different")
+            st.write(
+                f"Unique quotes with wrong status (expected '{noresp_label}'): "
+                f"**{summary['wrong_noresp_count']}**"
+            )
+            if not wrong_noresp_view.empty:
+                st.dataframe(
+                    wrong_noresp_view,
+                    use_container_width=True,
+                    height=220,
+                )
+            else:
+                st.info(f"No mismatches found for expected '{noresp_label}'.")
+
+            st.markdown("---")
+            st.subheader("Download Full Detailed Comparison (optional)")
+
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                merged.to_excel(writer, index=False, sheet_name="Comparison")
+            buffer.seek(0)
+
+            st.download_button(
+                label="Download Detailed Comparison Excel",
+                data=buffer,
+                file_name="quote_status_comparison.xlsx",
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+            )
+
+        except Exception as e:
+            st.error(f"Error during processing: {e}")
