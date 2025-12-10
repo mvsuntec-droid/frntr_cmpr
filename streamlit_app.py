@@ -34,7 +34,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # -------------------------------------------------
-# HELPERS (NO GLOBAL STATE)
+# HELPERS (NO GLOBAL DATA STATE)
 # -------------------------------------------------
 
 
@@ -124,9 +124,15 @@ def analyze_quotes(df1, df2, won_label, noresp_label):
         missing = required_2 - set(df2.columns)
         raise ValueError(f"File 2 missing required column(s): {missing}")
 
+    # Normalize quote IDs
     df1["quote_norm"] = df1["Recall Order"].apply(normalize_quote_id)
     df2["quote_norm"] = df2["Quote Number"].apply(normalize_quote_id)
 
+    # File 1 basic stats
+    total_file1_rows = len(df1)
+    unique_file1_quotes = df1["quote_norm"].nunique(dropna=True)
+
+    # Expected behavior from File 1
     expected_in_system = []
     expected_status = []
     for _, row in df1.iterrows():
@@ -143,9 +149,10 @@ def analyze_quotes(df1, df2, won_label, noresp_label):
 
     f1_expected = df1[df1["expected_in_system"]].copy()
 
-    total_should_show = len(f1_expected)
+    total_should_show_rows = len(f1_expected)
     unique_should_show = f1_expected["quote_norm"].nunique(dropna=True)
 
+    # File 2 minimal just for matching
     df2_min = df2[["quote_norm", "Status"]].copy()
 
     merged = f1_expected.merge(
@@ -157,18 +164,35 @@ def analyze_quotes(df1, df2, won_label, noresp_label):
 
     merged["found_in_system"] = merged["Status"].notna()
 
-    total_found = int(merged["found_in_system"].sum())
-    total_missing = int(total_should_show - total_found)
+    total_found_rows = int(merged["found_in_system"].sum())
+    total_missing_rows = int(total_should_show_rows - total_found_rows)
 
     unique_found = merged.loc[merged["found_in_system"], "quote_norm"].nunique(dropna=True)
     unique_missing = merged.loc[~merged["found_in_system"], "quote_norm"].nunique(dropna=True)
 
+    # Rows that should be present but are missing in File 2
+    missing_view = merged.loc[~merged["found_in_system"]].copy()
+    missing_view = (
+        missing_view[["Recall Order", "quote_norm", "expected_status",
+                      "Projected Order", "completed"]]
+        .drop_duplicates()
+        .rename(columns={
+            "Recall Order": "Recall Order (File 1)",
+            "quote_norm": "Quote ID (normalized)",
+            "expected_status": "Expected Status",
+            "Projected Order": "Projected Order (File 1)",
+            "completed": "Completed (File 1)",
+        })
+    )
+
+    # Mismatch analysis for Won
     won_mask = merged["expected_status"].str.casefold() == won_label.lower()
     won_found = merged[won_mask & merged["found_in_system"]].copy()
     wrong_won = won_found[
         won_found["Status"].fillna("").str.casefold() != won_label.lower()
     ].copy()
 
+    # Mismatch analysis for No Response
     noresp_mask = merged["expected_status"].fillna("").str.casefold() == noresp_label.lower()
     noresp_found = merged[noresp_mask & merged["found_in_system"]].copy()
     wrong_noresp = noresp_found[
@@ -176,13 +200,18 @@ def analyze_quotes(df1, df2, won_label, noresp_label):
     ].copy()
 
     summary = {
-        "total_file1_rows": int(len(df1)),
-        "total_should_show": int(total_should_show),
+        # File 1
+        "total_file1_rows": int(total_file1_rows),
+        "unique_file1_quotes": int(unique_file1_quotes),
+        # Expected presence
+        "total_should_show_rows": int(total_should_show_rows),
         "unique_should_show": int(unique_should_show),
-        "total_found": int(total_found),
-        "total_missing": int(total_missing),
+        # Actual presence
         "unique_found": int(unique_found),
         "unique_missing": int(unique_missing),
+        "total_found_rows": int(total_found_rows),
+        "total_missing_rows": int(total_missing_rows),
+        # Status mismatches
         "wrong_won_count": int(wrong_won["quote_norm"].nunique(dropna=True)),
         "wrong_noresp_count": int(wrong_noresp["quote_norm"].nunique(dropna=True)),
     }
@@ -211,11 +240,11 @@ def analyze_quotes(df1, df2, won_label, noresp_label):
         )
     )
 
-    return summary, wrong_won_view, wrong_noresp_view, merged
+    return summary, wrong_won_view, wrong_noresp_view, missing_view, merged
 
 
 # -------------------------------------------------
-# UI (ALL IN ONE PAGE, NO STATE FOR DATA)
+# UI
 # -------------------------------------------------
 
 st.title("quote-status-mapper")
@@ -257,41 +286,83 @@ if st.button("Run Comparison"):
             df1 = read_any_table(file1)
             df2 = read_any_table(file2)
 
-            summary, wrong_won_view, wrong_noresp_view, merged = analyze_quotes(
-                df1, df2, won_label=won_label, noresp_label=noresp_label
-            )
+            (
+                summary,
+                wrong_won_view,
+                wrong_noresp_view,
+                missing_view,
+                merged,
+            ) = analyze_quotes(df1, df2, won_label=won_label, noresp_label=noresp_label)
 
-            st.subheader("Summary")
-
-            c1, c2, c3 = st.columns(3)
+            # ---- File 1 summary ----
+            st.subheader("File 1 Summary")
+            c1, c2 = st.columns(2)
             with c1:
-                st.metric("Total rows in File 1", summary["total_file1_rows"])
-                st.metric(
-                    "Quotes that SHOULD appear in File 2 (rows)",
-                    summary["total_should_show"],
-                )
-                st.metric(
-                    "Quotes that SHOULD appear (unique)",
-                    summary["unique_should_show"],
-                )
+                st.metric("Total uploaded rows (File 1)", summary["total_file1_rows"])
             with c2:
-                st.metric("Quotes FOUND in File 2 (rows)", summary["total_found"])
                 st.metric(
-                    "Quotes FOUND in File 2 (unique)",
-                    summary["unique_found"],
+                    "Unique quote number count (File 1)",
+                    summary["unique_file1_quotes"],
                 )
+
+            st.markdown("---")
+
+            # ---- Result summary (what should be in File 2) ----
+            st.subheader("Result Summary (Quote presence in File 2)")
+
+            c3, c4, c5 = st.columns(3)
             with c3:
                 st.metric(
-                    "Quotes MISSING from File 2 (rows)",
-                    summary["total_missing"],
+                    "Total UNIQUE quote numbers that SHOULD be in File 2",
+                    summary["unique_should_show"],
                 )
+            with c4:
                 st.metric(
-                    "Quotes MISSING from File 2 (unique)",
+                    "Available quote number count (unique)",
+                    summary["unique_found"],
+                )
+            with c5:
+                st.metric(
+                    "Missing quote number count (unique)",
                     summary["unique_missing"],
                 )
 
             st.markdown("---")
 
+            # ---- Missing quote details + download ----
+            st.subheader(
+                "Quotes that SHOULD be in File 2 but are MISSING (unique list)"
+            )
+            if not missing_view.empty:
+                st.dataframe(
+                    missing_view.head(50),
+                    use_container_width=True,
+                    height=220,
+                )
+
+                # Download missing details
+                miss_buf = io.BytesIO()
+                with pd.ExcelWriter(miss_buf, engine="openpyxl") as writer:
+                    missing_view.to_excel(
+                        writer, index=False, sheet_name="MissingQuotes"
+                    )
+                miss_buf.seek(0)
+
+                st.download_button(
+                    label="Download Missing Quote Details",
+                    data=miss_buf,
+                    file_name="missing_quotes.xlsx",
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    ),
+                )
+            else:
+                st.info("No missing quotes based on the current logic.")
+
+            st.markdown("---")
+
+            # ---- Incorrect Won statuses ----
             st.subheader(f"Quotes that SHOULD be '{won_label}' but are different")
             st.write(
                 f"Unique quotes with wrong status (expected '{won_label}'): "
@@ -308,7 +379,10 @@ if st.button("Run Comparison"):
 
             st.markdown("---")
 
-            st.subheader(f"Quotes that SHOULD be '{noresp_label}' but are different")
+            # ---- Incorrect No Response statuses ----
+            st.subheader(
+                f"Quotes that SHOULD be '{noresp_label}' but are different"
+            )
             st.write(
                 f"Unique quotes with wrong status (expected '{noresp_label}'): "
                 f"**{summary['wrong_noresp_count']}**"
@@ -334,7 +408,10 @@ if st.button("Run Comparison"):
                 label="Download Detailed Comparison Excel",
                 data=buffer,
                 file_name="quote_status_comparison.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
             )
 
         except Exception as e:
